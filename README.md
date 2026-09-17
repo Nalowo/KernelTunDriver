@@ -1,196 +1,339 @@
-# kmod-qemu-template
+# KernelTunDriver
 
-> Шаблон репозитория для разработки модулей ядра Linux с автономным QEMU-окружением: собирает собственное минимальное ядро, грузит модуль в виртуальную машину и даёт отладку через GDB. Работает под WSL2 без хостовых заголовков.
+> Модуль ядра Linux `ktun` — виртуальный сетевой интерфейс TUN-типа, упрощённый аналог
+> `drivers/net/tun.c`. Итоговый проект курса OTUS «Разработка ядра Linux».
 
-Копируешь шаблон — и сразу пишешь модуль: окружение для сборки, запуска и отладки уже внутри. Ключевая идея: модуль собирается и грузится **не в ядро хоста, а в отдельное ядро в QEMU**. Поэтому шаблон одинаково работает на «обычном» Linux и под WSL2, где хостовых заголовков ядра нет и `insmod` в живое ядро невозможен.
+Модуль создаёт в системе **сетевой интерфейс без сетевой карты**. Он выглядит как `eth0`: у него есть
+имя, адрес, MTU и счётчики в `ip link`. Но пакеты, которые система отправляет в этот интерфейс, не
+уходят в провод. Их получает **обычная программа**, читая файл `/dev/ktun`. И наоборот: всё, что
+программа записала в `/dev/ktun`, система воспринимает как пакет, пришедший из сети.
 
-## Структура
+Так устроены VPN-клиенты, эмуляторы сетей и туннели: программа сама решает, что сделать с пакетом —
+зашифровать, отправить по UDP или ответить на него.
 
+| | |
+|---|---|
+| **Ядро** | Linux 6.18 (LTS), запуск в QEMU |
+| **Модуль** | `ktun.ko` → `/dev/ktun`, интерфейсы `ktun0`, `ktun1`, … |
+| **Утилита** | `ktunctl` — печать пакетов и ответ на `ping` из userspace |
+| **Проверка** | отладочное ядро: KASAN, lockdep, kmemleak, `DEBUG_ATOMIC_SLEEP` |
+
+## Как это работает
+### Общая картина
+
+```mermaid
+flowchart TB
+    subgraph US["Пространство пользователя"]
+        PING["ping 10.0.0.2"]
+        CTL["ktunctl echo"]
+    end
+    subgraph K["Ядро"]
+        STACK["Сетевой стек<br/>маршрутизация, ICMP"]
+        subgraph MOD["Модуль ktun.ko"]
+            NET["ktun0<br/>struct net_device"]
+            Q[("очередь пакетов<br/>sk_buff_head")]
+            CHR["/dev/ktun<br/>file_operations"]
+        end
+    end
+
+    PING -- "sendto()" --> STACK
+    STACK -- "ndo_start_xmit()" --> NET
+    NET -- "в хвост" --> Q
+    Q -- "из головы" --> CHR
+    CHR -- "read()" --> CTL
+    CTL -- "write() ответа" --> CHR
+    CHR -- "netif_rx()" --> STACK
+    STACK -- "echo reply" --> PING
 ```
+
+Модуль соединяет две сущности ядра:
+
+- **сетевой интерфейс** (`struct net_device`) — с ним разговаривает сетевой стек;
+- **символьное устройство** `/dev/ktun` (`struct file_operations`) — с ним разговаривает программа.
+
+Между ними — очередь пакетов. Она нужна потому, что стек отправляет пакет в атомарном контексте, где
+нельзя ни спать, ни копировать данные в память программы, а программа в этот момент может вообще не
+сидеть в `read()`. Очередь разводит эти два события во времени.
+
+### Путь пакета
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as ping
+    participant S as сетевой стек
+    participant D as ktun (модуль)
+    participant U as ktunctl
+
+    Note over S,D: TX интерфейса: стек → программа
+    P->>S: echo request на 10.0.0.2
+    S->>D: ndo_start_xmit(skb)
+    D->>D: skb в очередь, tx_packets++, разбудить читателей
+    U->>D: read(fd)
+    D-->>U: IP-пакет целиком (один read = один пакет)
+
+    Note over S,D: RX интерфейса: программа → стек
+    U->>U: собрать echo reply
+    U->>D: write(fd, пакет)
+    D->>D: новый skb, проверка версии IP, rx_packets++
+    D->>S: netif_rx(skb)
+    S-->>P: echo reply
+```
+
+### Почему TX и RX «перевёрнуты»
+Счётчики считаются **с точки зрения интерфейса**, как у настоящей сетевой карты. Это первое, что
+путает при отладке:
+
+| Направление | Для интерфейса `ktun0` | Для программы | Функции драйвера |
+|-------------|------------------------|---------------|------------------|
+| стек → программа | **TX** — передано | **читает** из `/dev/ktun` | `ndo_start_xmit` → очередь → `read` |
+| программа → стек | **RX** — принято | **пишет** в `/dev/ktun` | `write` → `netif_rx` |
+
+### TUN, а не TAP
+Через `/dev/ktun` ходят **голые IP-пакеты**, без Ethernet-заголовка: первый байт прочитанного пакета —
+начало IP-заголовка. У интерфейса нет MAC-адреса, и ARP не нужен:
+
+| Поле `net_device` | Значение |
+|-------------------|----------|
+| `type` | `ARPHRD_NONE` |
+| `flags` | `IFF_POINTOPOINT \| IFF_NOARP` |
+| `hard_header_len`, `addr_len` | `0` |
+| `mtu` / `min_mtu` / `max_mtu` | `1500` / `68` / `9000` |
+| `tx_queue_len` | `500` — очередь стека (qdisc) для управления потоком |
+
+## Интерфейсы модуля
+Модуль разговаривает с внешним миром по четырём каналам, у каждого своя ниша.
+
+```mermaid
+flowchart LR
+    APP["программа<br/>с дескриптором"] -- "open / read / write / poll" --> DEV["/dev/ktun"]
+    APP -- "ioctl: ATTACH, GET_INFO, SET_MTU" --> DEV
+    SH["человек в shell"] -- "cat" --> PROC["/proc/ktun<br/>сводка по всем интерфейсам"]
+    SH -- "cat / echo" --> SYS["/sys/...<br/>одно значение — один файл"]
+```
+
+### `/dev/ktun` — данные
+| Вызов | Поведение |
+|-------|-----------|
+| `open` | создаёт **пустое** состояние файла; интерфейса ещё нет |
+| `ioctl(KTUN_IOC_ATTACH)` | создаёт `ktunN` и навсегда привязывает его к этому открытому файлу |
+| `read` | один вызов = один пакет; ждёт, если очередь пуста (`EAGAIN` при `O_NONBLOCK`) |
+| `write` | один вызов = один IPv4/IPv6-пакет; интерфейс должен быть поднят |
+| `poll` | `EPOLLIN`, когда в очереди есть пакет; запись готова всегда |
+| последний `close` | удаляет интерфейс и всё, что было в очереди |
+
+**Жизненный цикл открытого файла:**
+```mermaid
+stateDiagram-v2
+    state "Открыт, интерфейса нет" as Opened
+    state "Привязан, ktunN DOWN" as Attached
+    state "Интерфейс поднят, UP" as Up
+    [*] --> Opened: open()
+    Opened --> Attached: ioctl ATTACH
+    Attached --> Up: ip link set ktunN up
+    Up --> Attached: ip link set ktunN down
+    Opened --> [*]: close()
+    Attached --> [*]: close(), интерфейс удалён
+    Up --> [*]: close(), интерфейс удалён
+```
+
+**Каждая программа — своя очередь.** Состояние хранится в открытом файле (`file->private_data`),
+поэтому два процесса, открывших `/dev/ktun`, получают два независимых интерфейса и две очереди. Так
+выполняется требование курса «у каждого процесса свой буфер». Процессы после `fork()` делят один
+открытый файл, а значит, и одну очередь — как и в настоящем `tun`.
+
+### `ioctl` — управление
+ABI в [src/ktun_ioctl.h](src/ktun_ioctl.h) общий для модуля и утилиты, поля фиксированной ширины.
+
+| Команда | Что делает | Основные ошибки |
+|---------|------------|-----------------|
+| `KTUN_IOC_ATTACH` | создать интерфейс; пустое имя → `ktun%d` | `EPERM` без `CAP_NET_ADMIN`, `EBUSY` уже привязан, `EEXIST` имя занято, `EINVAL` плохое имя |
+| `KTUN_IOC_GET_INFO` | имя, `ifindex`, MTU, длина и лимит очереди | `EBADFD` не привязан |
+| `KTUN_IOC_SET_MTU` | сменить MTU (`dev_set_mtu` под `rtnl_lock`) | `EBADFD`, `EINVAL` вне `[68, 9000]` |
+| любая другая | — | `ENOTTY` |
+
+### `/proc/ktun` — сводка
+```console
+# cat /proc/ktun
+name     pid    state  queue   rx_packets  rx_bytes  tx_packets  tx_bytes  tx_dropped  truncated
+ktun0    123    up     0/64    3           252       3           252       0           0
+ktun1    131    down   2/64    0           0         2           168       0           0
+```
+
+### `/sys` — настройки
+| Файл | Доступ | Смысл |
+|------|--------|-------|
+| `/sys/class/misc/ktun/default_queue_limit` | rw | лимит очереди для новых интерфейсов, `[1, 4096]`, по умолчанию `64` |
+| `/sys/class/misc/ktun/interface_count` | ro | сколько интерфейсов существует |
+| `/sys/class/net/ktunN/ktun/queue_limit` | rw | лимит очереди этого интерфейса |
+| `/sys/class/net/ktunN/ktun/queue_len` | ro | сколько пакетов ждут чтения |
+| `/sys/class/net/ktunN/ktun/owner_pid` | ro | PID процесса, создавшего интерфейс |
+
+## Устройство изнутри
+### Управление потоком
+Если программа перестала читать, а стек продолжает отправлять, очередь росла бы без предела. Поэтому
+у неё есть лимит, и на лимите драйвер просит стек подождать:
+
+```mermaid
+flowchart LR
+    S["сетевой стек"] --> QD[("qdisc стека<br/>tx_queue_len = 500")]
+    QD -- "ndo_start_xmit" --> Q[("очередь ktun<br/>до queue_limit")]
+    Q -- "read()" --> U["программа"]
+    Q -. "длина = лимит:<br/>netif_stop_queue" .-> QD
+    U -. "после read, длина меньше лимита:<br/>netif_wake_queue" .-> QD
+```
+
+После `netif_stop_queue` драйвер **сразу перепроверяет** длину очереди. Иначе возможна гонка:
+`read()` опустошил очередь и проверил «остановлена ли?» за мгновение до остановки, и очередь
+осталась бы остановленной навсегда.
+
+### Контексты и блокировки
+`ndo_start_xmit` выполняется в атомарном контексте (softirq): там нельзя спать, брать мьютекс,
+выделять память с `GFP_KERNEL` и вызывать `copy_to_user`. Отсюда выбор защиты для каждого объекта:
+
+| Данные | Кто обращается | Защита |
+|--------|----------------|--------|
+| очередь пакетов | `ndo_start_xmit` (BH), `read` | встроенный спинлок `sk_buff_head` |
+| счётчики `dev->stats` | `ndo_start_xmit`, `write` | атомарные `DEV_STATS_INC` / `DEV_STATS_ADD` |
+| лимит очереди | `ndo_start_xmit`, `/sys` | `READ_ONCE` / `WRITE_ONCE` |
+| привязка файла к интерфейсу | `ioctl` из нескольких потоков | мьютекс в состоянии файла |
+| глобальный список интерфейсов | `ATTACH`, `close`, `/proc` | глобальный мьютекс |
+
+### Владение `sk_buff`
+У каждого пакета в каждый момент ровно один владелец, и освобождает его только владелец:
+
+- стек вызвал `ndo_start_xmit(skb)` → пакет **наш**: положить в очередь или освободить;
+- `read()` забрал пакет из очереди → скопировал программе → освободил;
+- `write()` создал пакет и вызвал `netif_rx(skb)` → пакет **стека**, трогать его больше нельзя.
+
+Нарушение в одну сторону ловит kmemleak (утечка), в другую — KASAN (use-after-free).
+
+### Порядок удаления интерфейса
+При последнем `close()` каждый шаг опирается на гарантию предыдущего:
+
+```mermaid
+flowchart LR
+    A["1. убрать из<br/>глобального списка"] --> B["2. unregister_netdev<br/>xmit больше не придёт"]
+    B --> C["3. skb_queue_purge<br/>очистить очередь"]
+    C --> D["4. free_netdev<br/>вместе с личными данными"]
+    D --> E["5. освободить<br/>состояние файла"]
+```
+
+Выгрузить модуль, пока открыт хоть один `/dev/ktun`, нельзя: `.owner = THIS_MODULE` держит ссылку на
+модуль, и `rmmod` вернёт ошибку.
+
+### Структура исходников
+```text
 .
-├── Makefile            # сборка под хост + цели qemu-* + compile_commands
+├── Makefile              # сборка модуля (qemu-*) и утилиты (tools)
 ├── src/
-│   ├── main.c          # отлаживаемый char-device (misc /dev/template, read/write)
-│   └── Kbuild          # имя модуля и список объектов
-├── build/              # сюда складываются ВСЕ артефакты сборки (.ko и пр.)
-├── .vscode/            # графический дебаг через QEMU из коробки
-│   ├── launch.json     # подключение отладчика к gdbstub QEMU
-│   ├── tasks.json      # сборка / автозапуск QEMU
-│   ├── settings.json   # IntelliSense (C, gnu11, compile_commands)
-│   └── extensions.json # рекомендация ms-vscode.cpptools
-└── devtools/           # автономное QEMU-окружение
-    ├── config.defaults # версии ядра/busybox, параметры QEMU, KERNEL_DEBUG
-    ├── setup.sh        # сборка минимального ядра + initramfs (разово)
-    ├── build.sh        # сборка ЭТОГО модуля против QEMU-ядра
-    ├── boot.sh         # запуск QEMU (+ --gdb / --test)
-    ├── gdb.sh          # подключение GDB, брейк на инициализации модуля
-    ├── test.sh         # авто insmod/rmmod (для CI)
-    ├── kernel.config       # тонкий профиль конфигурации ядра
-    ├── kernel.debug.config # debug-профиль (KASAN/lockdep/kmemleak), опционально
-    └── initramfs/init  # PID 1 гостя: монтирует 9p, даёт shell
+│   ├── Kbuild            # ktun.o = main.o chardev.o netdev.o procfs.o sysfs.o
+│   ├── ktun.h            # внутренние структуры: ktunNet (интерфейс), ktunFile (открытый файл)
+│   ├── ktun_ioctl.h      # ABI ioctl, общий с утилитой
+│   ├── main.c            # init/exit, misc-устройство, глобальный список интерфейсов
+│   ├── chardev.c         # file_operations /dev/ktun
+│   ├── netdev.c          # net_device_ops, очередь пакетов, управление потоком
+│   ├── procfs.c          # /proc/ktun
+│   └── sysfs.c           # атрибуты /sys
+├── tools/ktunctl.c       # утилита: dump / echo / selftest
+└── devtools/             # стенд QEMU + demo.sh
 ```
 
-Все артефакты сборки (`*.ko`, `*.o`, `*.mod.c`, `Module.symvers`, `modules.order`, `.*.cmd`) попадают только в `build/`. Корень проекта и `src/` остаются чистыми — в `src/` лежат лишь исходники и `Kbuild`.
+## Сборка и запуск
+Модуль собирается и грузится **не в ядро хоста, а в отдельное ядро в QEMU**. Так проект одинаково
+работает на обычном Linux и под WSL2, где заголовков ядра хоста нет.
 
-## Требования (Debian/Ubuntu, в т.ч. WSL2)
+**Зависимости хоста:** `gcc`, `make`, `qemu-system-x86_64`, инструменты сборки ядра (`flex`, `bison`,
+`bc`, `libelf-dev`, `libssl-dev`), статическая `libc` для утилиты.
 
-```bash
-sudo apt-get update
-sudo apt-get install build-essential flex bison bc libelf-dev libssl-dev \
-                     cpio qemu-system-x86 gdb
-# опционально для разработки:
-sudo apt-get install clang-format bear
+```sh
+make qemu-setup-debug   # один раз: ядро 6.18 с KASAN/lockdep/kmemleak + BusyBox initramfs
+make qemu-build         # модуль  -> build/ktun.ko
+make tools              # утилита -> build/ktunctl (статическая: в госте нет libc)
+make qemu-test          # автотест: insmod -> dmesg -> rmmod, печатает TEST_OK
+make qemu-boot          # интерактивный гость; каталог проекта смонтирован в /mnt/host
 ```
 
-## Быстрый старт
+KASAN примерно удваивает расход памяти гостя, поэтому стоит задать `QEMU_MEM="2G"` в
+`devtools/config.local`.
 
-```bash
-make qemu-setup     # разово: качает и собирает ядро + initramfs (долго, ~10-20 мин)
-make qemu-boot      # собрать модуль и загрузить гостя
-# внутри гостя (модуль создаёт /dev/template):
-insmod /mnt/host/build/template.ko
-echo hello > /dev/template     # -> template_write
-cat /dev/template              # -> template_read
-rmmod template
-poweroff -f         # выйти из гостя
+Отладка через GDB: `make qemu-debug` в одном терминале, `make gdb-attach` в другом.
+
+## Демонстрация
+### Ответ на `ping` из userspace
+В госте (`make qemu-boot`):
+
+```console
+# insmod /mnt/host/build/ktun.ko
+# /mnt/host/build/ktunctl echo &
+ktun0
+# ip link set ktun0 up
+# ip addr add 10.0.0.1/24 dev ktun0
+# ping -c 3 10.0.0.2
+PING 10.0.0.2 (10.0.0.2): 56 data bytes
+64 bytes from 10.0.0.2: seq=0 ttl=64 time=0.412 ms
+...
+3 packets transmitted, 3 packets received, 0% packet loss
 ```
 
-`make help` покажет все цели.
+Машины с адресом `10.0.0.2` не существует. На `ping` отвечает `ktunctl`: она прочитала echo request,
+поменяла местами адреса, сменила тип ICMP на echo reply, пересчитала контрольные суммы и записала
+пакет обратно.
 
-## Развёртывание, запуск, отладка
-
-### 1. Развёртывание окружения (разово)
-
-```bash
-make qemu-setup        # = devtools/setup.sh
-```
-Скрипт скачивает исходники ядра (по умолчанию **6.18.37**, LTS) и BusyBox, собирает минимальное ядро с отладочной информацией (`vmlinux` для GDB, `nokaslr`, debugfs/proc/sys, 9p) и пакует initramfs из статического BusyBox. Всё кладётся в `devtools/.cache/` (в `.gitignore`). Шаги идемпотентны: повторный запуск ничего не пересобирает, пока не менялись конфиги. После смены `KERNEL_VERSION` запусти `setup.sh` снова. Бери версию из LTS-серии (6.18, 6.12, ...): обычный stable после EOL вычищается с kernel.org и URL начинает отдавать 404.
-
-### 2. Сборка модуля
-
-```bash
-make qemu-build        # = devtools/build.sh: сборка против QEMU-ядра -> build/template.ko
-```
-Под нативным Linux с установленными заголовками можно собрать и под хостовое ядро обычным `make` (тогда `make load` / `make unload` грузят в хост). Под WSL2 используй только `qemu-*`.
-
-### 3. Запуск и проверка
-
-```bash
-make qemu-boot         # собрать + загрузить интерактивного гостя
-```
-Корень проекта виден в госте как `/mnt/host/` через 9p — правки на хосте сразу доступны в VM, образ пересобирать не нужно. Собранный модуль лежит в `/mnt/host/build/`. После `insmod` модуль создаёт `/dev/template` (misc-устройство) — читай/пиши его `cat`/`echo`, чтобы дёргать `read`/`write`.
-
-Автотест без интерактива (для CI; выходит с ненулевым кодом при ошибке):
-```bash
-make qemu-test         # insmod -> dmesg -> rmmod -> poweroff
+### Режимы `ktunctl`
+```text
+ktunctl [-n NAME] [-m MTU] dump      # печатать каждый пакет
+ktunctl [-n NAME] [-m MTU] echo      # печатать и отвечать на IPv4 ICMP echo request
+ktunctl selftest                     # проверить коды ошибок, которые не получить из shell
 ```
 
-### 4. Отладка через GDB
-
-**Как устроено.** Ядро в QEMU отдаёт отладку по gdbstub на `:1234`. Символы `vmlinux` есть сразу, а символы **модуля** появляются только после его загрузки и вызова `lx-symbols` (он читает адреса секций модуля из памяти ядра и делает `add-symbol-file`). Поэтому брейк на функции модуля до `insmod` + `lx-symbols` не к чему привязать. `nokaslr` в cmdline делает адреса стабильными между перезагрузками.
-
-**Два пути — выбери один за раз (один клиент на gdbstub!):**
-- **VS Code (F5)** — графика, брейки кликом. `make qemu-debug`, затем F5 «Kernel: attach to QEMU». Сырые команды gdb — в Debug Console с префиксом `-exec`.
-- **Терминал** — `make qemu-debug` в одном терминале, `make gdb-attach` в другом. Надёжнее в моменты, когда cppdbg конфликтует с `lx-symbols` (см. ниже).
-
-**Канонический кейс — брейк в обычной функции модуля (read/write).**
-Функции `template_read`/`template_write` лежат в `.text` — привязываются штатно. Терминальный путь:
-```
-make gdb-attach                 # подключился, взвёл break do_init_module, continue
-# в госте:
-insmod /mnt/host/build/template.ko   # -> останов на do_init_module
-# если break на do_init_module НЕ сработал на insmod: пауза (Ctrl-C),
-# затем -exec lx-symbols (перезагружает символы vmlinux и переармирует
-# брейкпоинты), после чего повтори insmod
-```
-```
-(gdb) lx-symbols                # подгрузить символы template
-(gdb) break template_read
-(gdb) break template_write
-(gdb) continue
-# в госте:
-echo hi > /dev/template         # -> останов в template_write
-```
-Дальше как в обычном дебаге: `bt`, `next`/`step`, `info args`, `info locals`, `p count`, `p *ppos`. В VS Code то же самое: после `insmod` → `do_init_module` сделай `-exec lx-symbols`, затем поставь брейк кликом на строке в `template_read` (после загрузки символов он привяжется) и `cat /dev/template`.
-
-**Разобранные кейсы:**
-- *Проследить копирование в user space:* брейк в `template_write`, `next` до `copy_from_user`, `p count`, после копирования `x/16xb template_buf` — увидеть, что реально записалось.
-- *Поймать неверное значение:* `watch template_len` — останов на любой записи в переменную, `bt` покажет кто изменил.
-- *Проверить утечку:* собрать debug-профиль (`make qemu-setup-debug`), убрать `kfree` из `template_exit`, `insmod`/`rmmod`, затем в госте `echo scan > /sys/kernel/debug/kmemleak; cat /sys/kernel/debug/kmemleak` — kmemleak покажет утёкший `kzalloc`.
-- *Стек в точке останова:* `bt` в `template_read` покажет путь `vfs_read → template_read`.
-
-**Тяжёлый случай — брейк в `__init` (`template_init`).** Стараются избегать: функция в `.init.text`, которую ядро **освобождает сразу после init**, `lx-symbols` эту секцию не всегда мапит (`info symbol mod->init` → «No symbol»), а cppdbg об нёй спотыкается. Если всё же нужно — стой на `do_init_module` и ставь брейк **по адресу**, без имени:
-```
-(gdb) break *mod->init          # mod доступен в кадре do_init_module
-(gdb) continue                  # останов на входе template_init
+```console
+# ktunctl dump
+ktun0
+ktun0: IPv6 len=56 (skipped)
+ktun0: IPv4 ICMP 10.0.0.1 -> 10.0.0.2 echo request id=12 seq=1 len=84
 ```
 
-**Когда cppdbg шумит `No breakpoint number N` / `-var-create: unable to create variable object`** — это cppdbg дерётся с `lx-symbols` (тот удаляет и пересоздаёт символы/брейки модуля на каждый хук). Не твой баг. Пройди этот момент в терминальном `make gdb-attach` — там этой бухгалтерии нет.
+Утилита не настраивает адрес и не поднимает интерфейс — это делают стандартные команды `ip`. Так
+видна граница между драйвером и обычной настройкой сети. IPv6-пакеты сразу после `up` — служебные
+сообщения самого стека, утилита их только печатает.
 
-> TUI в терминальном gdb: `TUI=1 make gdb-attach` (или `Ctrl-X A` в сессии). По умолчанию off — с `target remote` и выводом `lx-symbols` панели легко «съезжают» (`Ctrl-L` перерисовывает).
+## Проверка
+Все сценарии выполняются в одном сеансе QEMU на отладочном ядре.
 
-### 5. Профили ядра: тонкий и debug
+| # | Сценарий | Что показывает |
+|---|----------|----------------|
+| T1 | загрузка и выгрузка | `/dev/ktun` с правами `0600`, `/proc` и `/sys` на месте, `dmesg` чистый |
+| T2 | чтение непривязанного файла | `EBADFD` |
+| T3 | привязка | `ktun0` с флагами `POINTOPOINT,NOARP`, верный `owner_pid` |
+| T4 | стек → программа | `dump` видит ICMP echo request, растёт TX |
+| T5 | ответ на `ping` | 0% потерь, RX = 3 |
+| T6 | закрытие файла | интерфейс исчезает |
+| T7 | две программы | две независимые очереди и счётчики |
+| T8 | управление потоком | при остановленном читателе очередь не растёт выше лимита, нет `asks to queue packet` |
+| T9 | настройки `/sys` | неверные значения отклоняются, `default_queue_limit` применяется к новым интерфейсам |
+| T10 | MTU | `-m 1400` виден в `ip link`, `-m 10` — ошибка |
+| T11 | `ktunctl selftest` | все коды ошибок `ioctl`/`read`/`write` |
+| T12 | выгрузка и утечки | `rmmod` запрещён при открытом файле; kmemleak и `dmesg` пусты |
 
-По умолчанию собирается **тонкий** профиль (`devtools/kernel.config`) — быстрый, с базовым ftrace и символами для GDB. Когда нужны санитайзеры, собери **debug**-профиль, который домешивает `devtools/kernel.debug.config`:
+**Критерий чистоты:** в `dmesg` нет `BUG:`, `WARNING:`, `possible circular locking`,
+`sleeping function called from invalid context`; kmemleak ничего не находит.
 
-```bash
-make qemu-setup-debug          # = KERNEL_DEBUG=1 devtools/setup.sh
-```
-Debug-профиль добавляет KASAN (use-after-free / out-of-bounds в памяти ядра; на x86 — обязательно `KASAN_GENERIC`), `DEBUG_KMEMLEAK` (забытый `kfree` при `rmmod`), lockdep (`PROVE_LOCKING`) + `DEBUG_ATOMIC_SLEEP` (дедлоки, сон под спинлоком), kprobes и `IKCONFIG`. KASAN примерно удваивает расход памяти — подними `QEMU_MEM` до `2G` в `devtools/config.local`. Переключение профиля `setup.sh` замечает по стемпу и пересобирает ядро. Чтобы debug был постоянным, добавь `KERNEL_DEBUG=1` в `devtools/config.local`.
+**Стиль кода.** Имена в проекте — в личном стиле автора (PascalCase для функций, camelCase для
+переменных, `_` перед полями структур), поэтому `checkpatch` запускается без проверки CamelCase:
 
-> KGDB-по-serial намеренно не включён: отладку даёт gdbstub QEMU (`make qemu-debug`), serial-путь в этом окружении избыточен.
-
-## Создание нового модуля из шаблона
-
-```bash
-cp -r kmod-qemu-template ~/projects/MyModule && cd ~/projects/MyModule
-rm -rf .git && git init
-```
-Переименование модуля — два места:
-1. `src/Kbuild`: `obj-m += template.o` и `template-y := main.o` → замени `template` на имя модуля.
-2. `Makefile`: `MODULE_NAME := template` → то же имя.
-
-Дальше пиши код в `src/`. Несколько файлов — добавляй объекты в `template-y` в `src/Kbuild`. Потом обнови этот README под свой модуль (теглайн, секции «Что демонстрирует / Архитектура / Проверка» — как в остальных репозиториях).
-
-## WSL2: важные нюансы
-
-- **Держи проект в ext4 WSL** (`~/projects/...`), а не в `/mnt/c/...`. Сборка ядра на диске Windows через drvfs работает в разы медленнее и ломается на правах/регистре имён.
-- **Заголовки ставить не нужно.** `apt install linux-headers-$(uname -r)` под WSL2 падает (ядро кастомное, заголовков в репозитории нет) — и не требуется: `setup.sh` собирает заголовки для своего ядра сам.
-- **Ускорение KVM.** Проверь `ls -l /dev/kvm`. Есть и доступно — `boot.sh` сам добавит `-enable-kvm`. Нет — поднимется TCG (программная эмуляция, медленнее, но рабочая). На Windows 11 nested virtualization для WSL2 включён по умолчанию; при необходимости добавь в `%UserProfile%\.wslconfig`:
-  ```ini
-  [wsl2]
-  nestedVirtualization=true
-  ```
-  затем `wsl --shutdown`.
-
-## VS Code: графический дебаг и IntelliSense
-
-В шаблоне лежит готовый `.vscode/` — брейкпоинты по клику, шаги, стек, watch. Нужен расширение `ms-vscode.cpptools` (VS Code предложит его поставить из `extensions.json`; ставь в WSL-remote).
-
-IntelliSense без ложных ошибок на kernel-инклюдах:
-```bash
-make compdb            # bear -- make -> compile_commands.json (его подхватит cpptools)
+```sh
+devtools/.cache/linux-*/scripts/checkpatch.pl --no-tree --ignore CAMELCASE -f src/*.c src/*.h tools/*.c
 ```
 
-Рекомендуемый поток отладки (надёжный):
-1. В терминале VS Code: `make qemu-debug` — QEMU встаёт на паузу на `:1234`.
-2. Ставишь брейкпоинт в `src/main.c` (например, в `template_init`).
-3. F5 с конфигурацией **«Kernel: attach to QEMU»** — отладчик подключается.
-4. В Debug Console один раз: `-exec lx-symbols` — это включает автоподгрузку символов модуля при каждом `insmod` (на весь сеанс).
-5. Continue — гость догружается до shell (его консоль в том же терминале). Там: `insmod /mnt/host/build/template.ko`. Брейкпоинт связывается и срабатывает.
+## Ограничения
+Это сознательные решения, а не недоделки:
 
-Конфигурация **«Kernel: build, boot & attach»** делает шаги 1 и 3 одной кнопкой (через `tasks.json`), но фоновый матчер задачи капризен между версиями VS Code — если ведёт себя странно, используй вариант с attach.
-
-Отличия от отладки обычного userspace-приложения: ядро собрано с `-O2`, поэтому часть локальных переменных будет `<optimized out>`, а шаг иногда прыгает не по строкам; `insmod` и запись в `/proc`/sysfs ты инициируешь руками в консоли гостя. Управление потоком (брейкпоинты, шаги, стек) — один в один как в обычном дебаге.
-
-## Траблшутинг
-
-- **`setup.sh` падает на отсутствии пакета** — доустанови из списка требований (`flex`, `bison`, `bc`, `libelf-dev`, `libssl-dev`, `cpio`).
-- **Сборка ядра упала на `-Werror`** — фрагмент уже передаёт `-Wno-error` и `-std=gnu11`; если всё равно падает, проверь версию GCC и при необходимости понизь `KERNEL_VERSION` в `config.local`.
-- **9p mount failed в госте** — обычно ядро собрано без `CONFIG_NET_9P_VIRTIO`; пересобери (`make qemu-setup`), фрагмент его включает.
-- **GDB не видит символы** — убедись, что грузишь `vmlinux` из `devtools/.cache/kernel-build/` (это делает `gdb.sh`), а не stripped-образ.
-- **Мало места** — кэш ядра занимает несколько ГБ; чисти `devtools/.cache/` при смене версии.
-
-## Благодарности
-
-QEMU-окружение (минимальное ядро + BusyBox-initramfs + 9p + gdbstub) смоделировано по `devtools/` из проекта [sysprog21/lkmpg](https://github.com/sysprog21/lkmpg) (The Linux Kernel Module Programming Guide). Код примеров lkmpg распространяется под GPL-2.
+| Не поддерживается | Почему |
+|-------------------|--------|
+| режим TAP (L2, Ethernet-кадры) | вдвое больше работы с заголовками и ARP; TUN полностью раскрывает тему |
+| `ip link add type ktun` | требует `rtnl_link_ops` и netlink — отдельная подсистема |
+| интерфейсы, переживающие закрытие файла | усложняет жизненный цикл |
+| несколько очередей, привязка к CPU, NAPI | вопросы производительности, а не корректности |
+| offload'ы (GSO, аппаратные контрольные суммы) | железа нет |
+| сетевые пространства имён | интерфейсы создаются в основном пространстве |
+| ответ на IPv6 в `ktunctl` | IPv6-пакеты только печатаются |

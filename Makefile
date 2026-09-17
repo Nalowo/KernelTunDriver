@@ -1,26 +1,33 @@
-# Rename the module in TWO places: MODULE_NAME below, and obj-m/template-y in
+# The module name lives in TWO places: MODULE_NAME below, and obj-m/ktun-y in
 # src/Kbuild.
-MODULE_NAME := template
+MODULE_NAME := ktun
 
 KDIR     ?= /lib/modules/$(shell uname -r)/build
 SRC      := $(abspath src)
 BUILD    := $(abspath build)
 DEVTOOLS := $(abspath devtools)
 
-.PHONY: all clean load unload format compdb \
+.PHONY: all tools clean load unload format compdb \
         qemu-setup qemu-setup-debug qemu-build qemu-boot qemu-debug \
         gdb-attach qemu-test help
 
 # --- Build the module. KDIR defaults to the host kernel; build.sh overrides it
 # with the QEMU kernel. MO= sends every generated file straight to build/, so
 # src/ stays clean -- no manual sweeping. MO= needs kbuild >= 6.13, which the
-# template kernel (7.0.3) provides. ---
+# QEMU kernel (6.18) provides. ---
 all:
 	@mkdir -p $(BUILD)
 	$(MAKE) -C $(KDIR) M=$(SRC) MO=$(BUILD) modules
 	@test -f $(BUILD)/$(MODULE_NAME).ko \
 		|| { echo "ERROR: $(MODULE_NAME).ko not in build/ -- MO= needs kbuild >= 6.13"; exit 1; }
 	@echo "  -> $(BUILD)/$(MODULE_NAME).ko"
+
+# --- Userspace utility. Static: the BusyBox guest has no libc (R-U.1). ---
+tools: $(BUILD)/ktunctl
+
+$(BUILD)/ktunctl: tools/ktunctl.c src/ktun_ioctl.h
+	@mkdir -p $(BUILD)
+	gcc -static -O2 -Wall -Wextra -Isrc -o $@ tools/ktunctl.c
 
 clean:
 	-$(MAKE) -C $(KDIR) M=$(SRC) MO=$(BUILD) clean 2>/dev/null || true
@@ -33,7 +40,7 @@ unload:
 	sudo rmmod $(MODULE_NAME)
 
 format:
-	clang-format -i src/*.c $(wildcard src/*.h)
+	clang-format -i src/*.c $(wildcard src/*.h) tools/*.c
 
 # compile_commands.json for clangd / VS Code (needs `bear`). Built against the
 # QEMU kernel via build.sh -- under WSL2 there is no host kernel tree to use.

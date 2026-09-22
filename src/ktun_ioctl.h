@@ -16,22 +16,23 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define KTUN_IOC_MAGIC 0xF0	/* not listed in Documentation/userspace-api/ioctl/ioctl-number.rst */
+#define KTUN_IOC_MAGIC                                                         \
+  0xF0 /* not listed in Documentation/userspace-api/ioctl/ioctl-number.rst */
 
 struct ktunAttach {
-	char name[IFNAMSIZ];	/* in: wanted name, "" = "ktun%d"; out: actual name */
+  char name[IFNAMSIZ]; /* in: wanted name, "" = "ktun%d"; out: actual name */
 };
 
 struct ktunInfo {
-	char  name[IFNAMSIZ];
-	__u32 ifindex;
-	__u32 mtu;
-	__u32 queueLen;
-	__u32 queueLimit;
+  char name[IFNAMSIZ];
+  __u32 ifindex;
+  __u32 mtu;
+  __u32 queueLen;
+  __u32 queueLimit;
 };
 
-#define KTUN_IOC_ATTACH   _IOWR(KTUN_IOC_MAGIC, 1, struct ktunAttach)
+#define KTUN_IOC_ATTACH _IOWR(KTUN_IOC_MAGIC, 1, struct ktunAttach)
 #define KTUN_IOC_GET_INFO _IOR(KTUN_IOC_MAGIC, 2, struct ktunInfo)
-#define KTUN_IOC_SET_MTU  _IOW(KTUN_IOC_MAGIC, 3, __u32)
+#define KTUN_IOC_SET_MTU _IOW(KTUN_IOC_MAGIC, 3, __u32)
 
 #endif /* KTUN_IOCTL_H */

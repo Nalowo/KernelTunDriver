@@ -14,12 +14,12 @@
 #include "ktun.h"
 
 static int KtunNetOpen(struct net_device *dev) {
-  /* TODO R-7.3: netif_start_queue() */
+  netif_start_queue(dev);
   return 0;
 }
 
 static int KtunNetStop(struct net_device *dev) {
-  /* TODO R-7.3: netif_stop_queue(); queued packets stay readable */
+  netif_stop_queue(dev);
   return 0;
 }
 
@@ -39,26 +39,57 @@ static const struct net_device_ops ktunNetOps = {
     .ndo_start_xmit = KtunNetStartXmit,
 };
 
-/* alloc_netdev() setup callback. __maybe_unused: drop once KtunNetCreate uses
- * it. */
-static void __maybe_unused KtunNetSetup(struct net_device *dev) {
+static void KtunNetSetup(struct net_device *dev) {
   dev->netdev_ops = &ktunNetOps;
-  /*
-   * TODO R-7.1: TUN parameters from requirements §2 (type, flags, header_len,
-   * addr_len), mtu/min_mtu/max_mtu; R-7.2: tx_queue_len.
-   */
+  dev->type = ARPHRD_NONE;
+  dev->flags = IFF_POINTOPOINT | IFF_NOARP;
+  dev->hard_header_len = 0;
+  dev->addr_len = 0;
+  dev->mtu = KTUN_MTU_DEFAULT;
+  dev->max_mtu = KTUN_MTU_MAX;
+  dev->min_mtu = KTUN_MTU_MIN;
+  dev->tx_queue_len = KTUN_TX_QUEUE_LEN;
 }
 
-/*
- * R-3.1: alloc_netdev(sizeof(struct ktunNet), ..., KtunNetSetup), init the
- * private part, dev->sysfs_groups[0] = &ktunNetGroup, register_netdev(),
- * add to ktunList. On success *devOut is the registered interface.
- */
+// создание сетевого интерфейса
 int KtunNetCreate(const char *name, struct net_device **devOut) {
-  /* TODO */
-  return -EOPNOTSUPP;
+  struct net_device *dev;
+  dev = alloc_netdev(sizeof(struct ktunNet), name, strchr(name, '%') ? NET_NAME_ENUM : NET_NAME_USER, KtunNetSetup);
+  if (!dev)
+    return -ENOMEM;
+
+  struct ktunNet *kn = netdev_priv(dev);
+  kn->_dev = dev;
+  skb_queue_head_init(&kn->_txQueue);
+  init_waitqueue_head(&kn->_readWait);
+  kn->_queueLimit = READ_ONCE(ktunDefaultQueueLimit);
+  atomic_long_set(&kn->_truncated, 0);
+  kn->_ownerPid = task_tgid_vnr(current);
+  INIT_LIST_HEAD(&kn->_node);
+
+  dev->sysfs_groups[0] = &ktunNetGroup;
+  int err = register_netdev(dev);
+  if (err) {
+    free_netdev(dev);
+    return err;
+  }
+
+  mutex_lock(&ktunListLock);
+  list_add_tail(&kn->_node, &ktunList);
+  mutex_unlock(&ktunListLock);
+
+  *devOut = dev;
+  return 0;
 }
 
-/* R-12.1 steps 1-4: list_del, unregister_netdev, skb_queue_purge, free_netdev.
- */
-void KtunNetDestroy(struct net_device *dev) { /* TODO */ }
+void KtunNetDestroy(struct net_device *dev) {
+  struct ktunNet *kn = netdev_priv(dev);
+
+  mutex_lock(&ktunListLock);
+  list_del(&kn->_node);
+  mutex_unlock(&ktunListLock);
+
+  unregister_netdev(dev);
+  skb_queue_purge(&kn->_txQueue);
+  free_netdev(dev);
+}

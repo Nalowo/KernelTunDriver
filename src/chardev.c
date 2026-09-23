@@ -13,13 +13,24 @@
 #include "ktun.h"
 #include "ktun_ioctl.h"
 
+// вызывается на open(), устанавливает локальный контекст
 static int KtunChrOpen(struct inode *inode, struct file *file) {
-  /* TODO R-2.2: allocate struct ktunFile, init _lock, store in private_data. */
-  return -EOPNOTSUPP;
+  struct ktunFile *kf = kzalloc(sizeof(*kf), GFP_KERNEL);
+  if (kf == NULL)
+    return -ENOMEM;
+
+  mutex_init(&kf->_lock);
+  file->private_data = kf;
+
+  return 0;
 }
 
+// вызывается на close()
 static int KtunChrRelease(struct inode *inode, struct file *file) {
-  /* TODO R-2.3: if attached -- KtunNetDestroy() (order: R-12.1); free state. */
+  struct ktunFile *kf = file->private_data;
+  if (kf->_dev)
+    KtunNetDestroy(kf->_dev);
+  kfree(kf);
   return 0;
 }
 
@@ -40,12 +51,45 @@ static __poll_t KtunChrPoll(struct file *file, poll_table *wait) {
   return EPOLLERR;
 }
 
+// открытый файл получает свой сетевой интерфейс
+static long KtunChrAttach(struct ktunFile *kf, struct ktunAttach __user *uarg) {
+  if (!capable(CAP_NET_ADMIN))
+    return -EPERM;
+
+  struct ktunAttach req;
+  if (copy_from_user(&req, uarg, sizeof(req)))
+    return -EFAULT;
+  if (strnlen(req.name, IFNAMSIZ) == IFNAMSIZ)
+    return -EINVAL;
+
+  if (req.name[0] == '\0')
+    strscpy(req.name, "ktun%d", IFNAMSIZ);
+
+  mutex_lock(&kf->_lock);
+  long err;
+  if (kf->_dev) {
+    err = -EBUSY;
+    goto out;
+  }
+
+  err = KtunNetCreate(req.name, &kf->_dev);
+  if (err)
+    goto out;
+
+  strscpy(req.name, kf->_dev->name, IFNAMSIZ);
+  if (copy_to_user(uarg, &req, sizeof(req)))
+    err = -EFAULT;
+
+out:
+  mutex_unlock(&kf->_lock);
+  return err;
+}
+
 static long KtunChrIoctl(struct file *file, unsigned int cmd,
                          unsigned long arg) {
   switch (cmd) {
   case KTUN_IOC_ATTACH:
-    /* TODO R-3.1 */
-    return -EOPNOTSUPP;
+    return KtunChrAttach(file->private_data, (void __user *)arg);
   case KTUN_IOC_GET_INFO:
     /* TODO R-3.2 */
     return -EOPNOTSUPP;

@@ -23,13 +23,30 @@ static int KtunNetStop(struct net_device *dev) {
   return 0;
 }
 
+// перенос пакета из буфера интерфейса в сетевой буфер
 static netdev_tx_t KtunNetStartXmit(struct sk_buff *skb,
                                     struct net_device *dev) {
-  /*
-   * TODO R-7.4, R-8.1, R-8.2: enqueue, count TX, wake readers, stop the
-   * queue at the limit and re-check. Until then the skb is ours: free it.
-   */
-  kfree_skb(skb);
+  struct ktunNet *kn = netdev_priv(dev);
+  const unsigned int limit = READ_ONCE(kn->_queueLimit);
+  if (skb_queue_len_lockless(&kn->_txQueue) >= limit) {
+    DEV_STATS_INC(dev, tx_dropped);
+    kfree_skb(skb);
+    return NETDEV_TX_OK;
+  }
+
+  const unsigned int len = skb->len;
+  skb_queue_tail(&kn->_txQueue, skb);
+  DEV_STATS_INC(dev, tx_packets);
+  DEV_STATS_ADD(dev, tx_bytes, len);
+  wake_up_interruptible(&kn->_readWait);
+
+  if (skb_queue_len_lockless(&kn->_txQueue) >= limit) {
+    netif_stop_queue(dev);
+    smp_mb__after_atomic(); // бит stop виден другим CPU до перечитывания длины
+    if (skb_queue_len_lockless(&kn->_txQueue) < limit)
+      netif_wake_queue(dev);
+  }
+
   return NETDEV_TX_OK;
 }
 
@@ -54,7 +71,9 @@ static void KtunNetSetup(struct net_device *dev) {
 // создание сетевого интерфейса
 int KtunNetCreate(const char *name, struct net_device **devOut) {
   struct net_device *dev;
-  dev = alloc_netdev(sizeof(struct ktunNet), name, strchr(name, '%') ? NET_NAME_ENUM : NET_NAME_USER, KtunNetSetup);
+  dev = alloc_netdev(sizeof(struct ktunNet), name,
+                     strchr(name, '%') ? NET_NAME_ENUM : NET_NAME_USER,
+                     KtunNetSetup);
   if (!dev)
     return -ENOMEM;
 

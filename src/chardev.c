@@ -125,8 +125,18 @@ static ssize_t KtunChrWrite(struct file *file, const char __user *ubuf,
 }
 
 static __poll_t KtunChrPoll(struct file *file, poll_table *wait) {
-  /* TODO R-6.1..R-6.4 */
-  return EPOLLERR;
+  struct ktunFile *kf = file->private_data;
+  if (kf == NULL)
+    return EPOLLERR;
+
+  struct ktunNet *kn = netdev_priv(kf->_dev);
+  poll_wait(file, &kn->_readWait, wait);
+
+  __poll_t mask = EPOLLOUT | EPOLLWRNORM;
+  if (!skb_queue_empty_lockless(&kn->_txQueue))
+    mask |= EPOLLIN | EPOLLRDNORM;
+
+  return mask;
 }
 
 // открытый файл получает свой сетевой интерфейс

@@ -1,10 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * ktun -- the network interface: net_device_ops, packet queue, flow control.
- *
- * ndo_start_xmit runs in atomic (BH) context: no sleeping, no mutexes,
- * no GFP_KERNEL, no copy_to_user (R-7.4, R-11.1).
- */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/if_arp.h>
@@ -23,7 +17,6 @@ static int KtunNetStop(struct net_device *dev) {
   return 0;
 }
 
-// перенос пакета из буфера интерфейса в сетевой буфер
 static netdev_tx_t KtunNetStartXmit(struct sk_buff *skb,
                                     struct net_device *dev) {
   struct ktunNet *kn = netdev_priv(dev);
@@ -42,7 +35,7 @@ static netdev_tx_t KtunNetStartXmit(struct sk_buff *skb,
 
   if (skb_queue_len_lockless(&kn->_txQueue) >= limit) {
     netif_stop_queue(dev);
-    smp_mb__after_atomic(); // бит stop виден другим CPU до перечитывания длины
+    smp_mb__after_atomic();
     if (skb_queue_len_lockless(&kn->_txQueue) < limit)
       netif_wake_queue(dev);
   }
@@ -68,7 +61,6 @@ static void KtunNetSetup(struct net_device *dev) {
   dev->tx_queue_len = KTUN_TX_QUEUE_LEN;
 }
 
-// создание сетевого интерфейса
 int KtunNetCreate(const char *name, struct net_device **devOut) {
   struct net_device *dev;
   dev = alloc_netdev(sizeof(struct ktunNet), name,

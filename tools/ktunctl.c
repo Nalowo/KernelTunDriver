@@ -1,13 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * ktunctl -- userspace side of ktun (requirements §5).
- *
- *   ktunctl [-n NAME] [-m MTU] dump
- *   ktunctl [-n NAME] [-m MTU] echo
- *   ktunctl selftest
- *
- * Built statically (the guest has no libc): make tools -> build/ktunctl.
- */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -26,8 +17,8 @@
 #define KTUN_DEV_PATH "/dev/ktun"
 
 struct options {
-  const char *name; /* -n, NULL = "ktun%d" */
-  unsigned int mtu; /* -m, 0 = оставить как есть */
+  const char *name;
+  unsigned int mtu;
 };
 
 static void Usage(const char *prog) {
@@ -88,8 +79,8 @@ static void PrintPacket(const char *name, const unsigned char *buf,
 
   if (ip->protocol != IPPROTO_ICMP || ipHdrLen < sizeof(struct iphdr) ||
       ipHdrLen + sizeof(struct icmphdr) > len) {
-    printf("%s: IPv4 proto=%u %s -> %s len=%zu\n", name, ip->protocol, src,
-           dst, len);
+    printf("%s: IPv4 proto=%u %s -> %s len=%zu\n", name, ip->protocol, src, dst,
+           len);
     return;
   }
 
@@ -105,29 +96,24 @@ static void PrintPacket(const char *name, const unsigned char *buf,
          ntohs(icmp->un.echo.sequence), len);
 }
 
-// RFC 1071: сумма 16-битных слов в сетевом порядке, переносы из старших
-// разрядов возвращаются в младшие, результат инвертируется. Возвращает
-// значение уже в сетевом порядке — его можно класть прямо в заголовок.
 static uint16_t Checksum(const void *data, size_t len) {
   const unsigned char *p = data;
   uint32_t sum = 0;
 
   while (len > 1) {
-    sum += (uint32_t)p[0] << 8 | p[1]; // слово big-endian, как в сети
+    sum += (uint32_t)p[0] << 8 | p[1];
     p += 2;
     len -= 2;
   }
-  if (len) // нечётная длина: последний байт дополняется нулём справа
+  if (len)
     sum += (uint32_t)p[0] << 8;
 
-  while (sum >> 16) // свернуть переносы (end-around carry)
+  while (sum >> 16)
     sum = (sum & 0xffff) + (sum >> 16);
 
   return htons((uint16_t)~sum);
 }
 
-// Превращает ICMP echo request в echo reply на месте (§5, шаги 1-6).
-// Возвращает 0, если пакет не echo request и отвечать не нужно.
 static int MakeEchoReply(unsigned char *buf, size_t len) {
   if (len < sizeof(struct iphdr) || buf[0] >> 4 != 4)
     return 0;
@@ -145,23 +131,21 @@ static int MakeEchoReply(unsigned char *buf, size_t len) {
   if (icmp->type != ICMP_ECHO)
     return 0;
 
-  const uint32_t saddr = ip->saddr; // адреса местами: ответ идёт отправителю
+  const uint32_t saddr = ip->saddr;
   ip->saddr = ip->daddr;
   ip->daddr = saddr;
   ip->ttl = 64;
 
-  ip->check = 0; // поле суммы входит в сумму, поэтому сначала обнулить
+  ip->check = 0;
   ip->check = Checksum(ip, ipHdrLen);
 
-  icmp->type = ICMP_ECHOREPLY; // id, seq и данные остаются — по ним ping
-  icmp->code = 0;              // сопоставляет ответ с запросом
+  icmp->type = ICMP_ECHOREPLY;
+  icmp->code = 0;
   icmp->checksum = 0;
-  icmp->checksum = Checksum(icmp, icmpLen); // заголовок ICMP + данные
+  icmp->checksum = Checksum(icmp, icmpLen);
   return 1;
 }
 
-// Общий цикл dump/echo: ждём пакет в poll(), читаем, печатаем, в режиме
-// echo отвечаем на echo request. Выход — только по сигналу или ошибке.
 static int RunLoop(const struct options *opts, int echo) {
   char name[IFNAMSIZ];
   int fd = OpenAndAttach(opts, name);
@@ -171,23 +155,22 @@ static int RunLoop(const struct options *opts, int echo) {
     return 1;
   }
 
-  static unsigned char buf[65536]; // > KTUN_MTU_MAX; static — не на стеке
+  static unsigned char buf[65536];
   struct pollfd pfd = {.fd = fd, .events = POLLIN};
   for (;;) {
-    if (poll(&pfd, 1, -1) < 0) { // спим в ядре до wake_up из xmit
+    if (poll(&pfd, 1, -1) < 0) {
       if (errno == EINTR)
         continue;
       fprintf(stderr, "poll: %s\n", strerror(errno));
       break;
     }
-    if (pfd.revents & POLLERR) { // файл не привязан
+    if (pfd.revents & POLLERR) {
       fprintf(stderr, "poll: not attached\n");
       break;
     }
     if (!(pfd.revents & POLLIN))
       continue;
 
-    // после POLLIN не уснёт: пакет уже в очереди, читатель у неё один
     ssize_t n = read(fd, buf, sizeof(buf));
     if (n < 0) {
       if (errno == EINTR)
@@ -199,7 +182,7 @@ static int RunLoop(const struct options *opts, int echo) {
 
     if (!echo || !MakeEchoReply(buf, n))
       continue;
-    if (write(fd, buf, n) != n) { // один write = один пакет в стек
+    if (write(fd, buf, n) != n) {
       fprintf(stderr, "write: %s\n", strerror(errno));
       break;
     }
@@ -226,7 +209,7 @@ static void Expect(int num, const char *what, int ret, int err, int want) {
 }
 
 static int CmdSelftest(void) {
-  unsigned char buf[64] = {0x45}; // минимальный IPv4-заголовок (20 байт)
+  unsigned char buf[64] = {0x45};
   int ret;
 
   int fd = open(KTUN_DEV_PATH, O_RDWR);
@@ -298,7 +281,7 @@ static int CmdSelftest(void) {
     close(fd2);
   }
 
-  close(fd); // release удалит интерфейс
+  close(fd);
   printf("selftest: %s\n", selftestFailed ? "FAIL" : "PASS");
   return selftestFailed;
 }
@@ -326,7 +309,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   cmd = argv[optind];
-  setvbuf(stdout, NULL, _IOLBF, 0); // построчно даже при выводе в файл
+  setvbuf(stdout, NULL, _IOLBF, 0);
 
   if (strcmp(cmd, "dump") == 0)
     return CmdDump(&opts);

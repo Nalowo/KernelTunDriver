@@ -1,14 +1,4 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
-/*
- * ktun ioctl ABI -- shared by the module (src/) and ktunctl (tools/).
- *
- * Only types available on both sides: __u32 from <linux/types.h>, IFNAMSIZ
- * from <linux/if.h>. Fixed-width fields, so kernel and utility agree on the
- * byte layout (requirements §4.3).
- *
- * Userspace note: <linux/if.h> clashes with glibc's <net/if.h>; include only
- * one of them in the same translation unit.
- */
 #ifndef KTUN_IOCTL_H
 #define KTUN_IOCTL_H
 
@@ -16,11 +6,10 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define KTUN_IOC_MAGIC                                                         \
-  0xF0 /* not listed in Documentation/userspace-api/ioctl/ioctl-number.rst */
+#define KTUN_IOC_MAGIC 0xF0
 
 struct ktunAttach {
-  char name[IFNAMSIZ]; /* in: wanted name, "" = "ktun%d"; out: actual name */
+  char name[IFNAMSIZ];
 };
 
 struct ktunInfo {
@@ -35,4 +24,4 @@ struct ktunInfo {
 #define KTUN_IOC_GET_INFO _IOR(KTUN_IOC_MAGIC, 2, struct ktunInfo)
 #define KTUN_IOC_SET_MTU _IOW(KTUN_IOC_MAGIC, 3, __u32)
 
-#endif /* KTUN_IOCTL_H */
+#endif

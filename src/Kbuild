@@ -1,8 +1,5 @@
 obj-m += ktun.o
 
-# Objects that make up the module (paths relative to this src/ dir).
-# Note: there must be no ktun.c -- ktun.o is the linked composite.
 ktun-y := main.o chardev.o netdev.o procfs.o sysfs.o
 
-# Header search path (so src/*.c can #include "foo.h" from this dir)
 ccflags-y := -I$(src)

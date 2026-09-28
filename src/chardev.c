@@ -1,20 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * ktun -- /dev/ktun file_operations: open/release, read, write, poll, ioctl.
- * One open file = one packet queue = at most one interface (requirements §3).
- */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/fs.h>
 #include <linux/ip.h>
 #include <linux/module.h>
 #include <linux/poll.h>
+#include <linux/rtnetlink.h>
 #include <linux/uaccess.h>
 
 #include "ktun.h"
 #include "ktun_ioctl.h"
 
-// вызывается на open(), устанавливает локальный контекст
 static int KtunChrOpen(struct inode *inode, struct file *file) {
   struct ktunFile *kf = kzalloc(sizeof(*kf), GFP_KERNEL);
   if (kf == NULL)
@@ -22,48 +18,46 @@ static int KtunChrOpen(struct inode *inode, struct file *file) {
 
   mutex_init(&kf->_lock);
   file->private_data = kf;
-
   return 0;
 }
 
-// вызывается на close()
-static int KtunChrRelease(struct inode *, struct file *file) {
+static int KtunChrRelease(struct inode *inode, struct file *file) {
   struct ktunFile *kf = file->private_data;
   if (kf->_dev)
     KtunNetDestroy(kf->_dev);
+  mutex_destroy(&kf->_lock);
   kfree(kf);
   return 0;
 }
 
-// выборка пакета из буфера и отправка его вызвавшему read()
 static ssize_t KtunChrRead(struct file *file, char __user *ubuf, size_t count,
-                           loff_t *) {
+                           loff_t *ppos) {
   struct ktunFile *kf = file->private_data;
-  if (kf->_dev == NULL)
+  struct net_device *dev = READ_ONCE(kf->_dev);
+  if (dev == NULL)
     return -EBADFD;
 
   if (count == 0)
     return 0;
 
-  ssize_t err = 0;
-  struct ktunNet *kn = netdev_priv(kf->_dev);
-  struct sk_buff *skb = NULL;
+  struct ktunNet *kn = netdev_priv(dev);
+  struct sk_buff *skb;
   while (true) {
-    skb = skb_dequeue(&kn->_txQueue); // вынуть из головы под спинлоком очереди
+    skb = skb_dequeue(&kn->_txQueue);
     if (skb != NULL)
-      break;                        // есть пакет — дальше
-    if (file->f_flags & O_NONBLOCK) // неблокирующий режим — сразу "пусто"
+      break;
+    if (file->f_flags & O_NONBLOCK)
       return -EAGAIN;
-    err = wait_event_interruptible(kn->_readWait,
-                                   !skb_queue_empty_lockless(&kn->_txQueue));
-    if (err) // разбудил сигнал (Ctrl+C) — -ERESTARTSYS
+    int err = wait_event_interruptible(
+        kn->_readWait, !skb_queue_empty_lockless(&kn->_txQueue));
+    if (err)
       return err;
   }
 
   smp_mb();
-  if (netif_queue_stopped(kf->_dev) &&
-      (skb_queue_len_lockless(&kn->_txQueue) < READ_ONCE(kn->_queueLimit)))
-    netif_wake_queue(kf->_dev);
+  if (netif_running(dev) && netif_queue_stopped(dev) &&
+      skb_queue_len_lockless(&kn->_txQueue) < READ_ONCE(kn->_queueLimit))
+    netif_wake_queue(dev);
 
   const size_t n = min_t(size_t, count, skb->len);
   if (n < skb->len)
@@ -81,7 +75,7 @@ static ssize_t KtunChrRead(struct file *file, char __user *ubuf, size_t count,
 static ssize_t KtunChrWrite(struct file *file, const char __user *ubuf,
                             size_t count, loff_t *ppos) {
   struct ktunFile *kf = file->private_data;
-  struct net_device *dev = kf->_dev;
+  struct net_device *dev = READ_ONCE(kf->_dev);
   if (dev == NULL)
     return -EBADFD;
 
@@ -91,7 +85,6 @@ static ssize_t KtunChrWrite(struct file *file, const char __user *ubuf,
   if (count < sizeof(struct iphdr) || count > READ_ONCE(dev->mtu))
     return -EINVAL;
 
-  // процессный контекст: можно спать, поэтому GFP_KERNEL
   struct sk_buff *skb = alloc_skb(count, GFP_KERNEL);
   if (skb == NULL)
     return -ENOMEM;
@@ -101,7 +94,6 @@ static ssize_t KtunChrWrite(struct file *file, const char __user *ubuf,
     return -EFAULT;
   }
 
-  // версия IP из уже скопированных байт, а не повторным чтением из userspace
   switch (skb->data[0] >> 4) {
   case 4:
     skb->protocol = htons(ETH_P_IP);
@@ -115,10 +107,10 @@ static ssize_t KtunChrWrite(struct file *file, const char __user *ubuf,
   }
 
   skb->dev = dev;
-  skb_reset_mac_header(skb); // L2-заголовка у TUN нет: mac = network = data
+  skb_reset_mac_header(skb);
   skb_reset_network_header(skb);
 
-  netif_rx(skb); // skb теперь принадлежит стеку, дальше его не трогаем
+  netif_rx(skb);
   DEV_STATS_INC(dev, rx_packets);
   DEV_STATS_ADD(dev, rx_bytes, count);
   return count;
@@ -126,20 +118,19 @@ static ssize_t KtunChrWrite(struct file *file, const char __user *ubuf,
 
 static __poll_t KtunChrPoll(struct file *file, poll_table *wait) {
   struct ktunFile *kf = file->private_data;
-  if (kf == NULL)
+  struct net_device *dev = READ_ONCE(kf->_dev);
+  if (dev == NULL)
     return EPOLLERR;
 
-  struct ktunNet *kn = netdev_priv(kf->_dev);
+  struct ktunNet *kn = netdev_priv(dev);
   poll_wait(file, &kn->_readWait, wait);
 
   __poll_t mask = EPOLLOUT | EPOLLWRNORM;
   if (!skb_queue_empty_lockless(&kn->_txQueue))
     mask |= EPOLLIN | EPOLLRDNORM;
-
   return mask;
 }
 
-// открытый файл получает свой сетевой интерфейс
 static long KtunChrAttach(struct ktunFile *kf, struct ktunAttach __user *uarg) {
   if (!capable(CAP_NET_ADMIN))
     return -EPERM;
@@ -149,7 +140,6 @@ static long KtunChrAttach(struct ktunFile *kf, struct ktunAttach __user *uarg) {
     return -EFAULT;
   if (strnlen(req.name, IFNAMSIZ) == IFNAMSIZ)
     return -EINVAL;
-
   if (req.name[0] == '\0')
     strscpy(req.name, "ktun%d", IFNAMSIZ);
 
@@ -160,11 +150,13 @@ static long KtunChrAttach(struct ktunFile *kf, struct ktunAttach __user *uarg) {
     goto out;
   }
 
-  err = KtunNetCreate(req.name, &kf->_dev);
+  struct net_device *dev;
+  err = KtunNetCreate(req.name, &dev);
   if (err)
     goto out;
+  smp_store_release(&kf->_dev, dev);
 
-  strscpy(req.name, kf->_dev->name, IFNAMSIZ);
+  strscpy(req.name, dev->name, IFNAMSIZ);
   if (copy_to_user(uarg, &req, sizeof(req)))
     err = -EFAULT;
 
@@ -173,29 +165,61 @@ out:
   return err;
 }
 
+static long KtunChrGetInfo(struct net_device *dev,
+                           struct ktunInfo __user *uarg) {
+  struct ktunNet *kn = netdev_priv(dev);
+  struct ktunInfo info = {};
+
+  strscpy(info.name, dev->name, IFNAMSIZ);
+  info.ifindex = dev->ifindex;
+  info.mtu = READ_ONCE(dev->mtu);
+  info.queueLen = skb_queue_len_lockless(&kn->_txQueue);
+  info.queueLimit = READ_ONCE(kn->_queueLimit);
+
+  if (copy_to_user(uarg, &info, sizeof(info)))
+    return -EFAULT;
+  return 0;
+}
+
+static long KtunChrSetMtu(struct net_device *dev, __u32 __user *uarg) {
+  __u32 mtu;
+  if (get_user(mtu, uarg))
+    return -EFAULT;
+  if (mtu < KTUN_MTU_MIN || mtu > KTUN_MTU_MAX)
+    return -EINVAL;
+
+  rtnl_lock();
+  int err = dev_set_mtu(dev, mtu);
+  rtnl_unlock();
+  return err;
+}
+
 static long KtunChrIoctl(struct file *file, unsigned int cmd,
                          unsigned long arg) {
-  switch (cmd) {
-  case KTUN_IOC_ATTACH:
-    return KtunChrAttach(file->private_data, (void __user *)arg);
-  case KTUN_IOC_GET_INFO:
-    /* TODO R-3.2 */
-    return -EOPNOTSUPP;
-  case KTUN_IOC_SET_MTU:
-    /* TODO R-3.3: dev_set_mtu() under rtnl_lock() */
-    return -EOPNOTSUPP;
-  default:
-    return -ENOTTY; /* R-3.4 */
-  }
+  struct ktunFile *kf = file->private_data;
+  void __user *uarg = (void __user *)arg;
+
+  if (cmd == KTUN_IOC_ATTACH)
+    return KtunChrAttach(kf, uarg);
+
+  if (cmd != KTUN_IOC_GET_INFO && cmd != KTUN_IOC_SET_MTU)
+    return -ENOTTY;
+
+  struct net_device *dev = READ_ONCE(kf->_dev);
+  if (dev == NULL)
+    return -EBADFD;
+
+  return cmd == KTUN_IOC_GET_INFO ? KtunChrGetInfo(dev, uarg)
+                                  : KtunChrSetMtu(dev, uarg);
 }
 
 const struct file_operations ktunFops = {
-    .owner = THIS_MODULE, /* pins the module while a file is open */
+    .owner = THIS_MODULE,
     .open = KtunChrOpen,
     .release = KtunChrRelease,
     .read = KtunChrRead,
     .write = KtunChrWrite,
     .poll = KtunChrPoll,
     .unlocked_ioctl = KtunChrIoctl,
-    .llseek = noop_llseek, /* a packet stream has no position */
+    .llseek = noop_llseek,
 };

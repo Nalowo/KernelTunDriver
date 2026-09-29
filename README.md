@@ -13,10 +13,21 @@
 
 | | |
 |---|---|
-| **Ядро** | Linux 6.18 (LTS), запуск в QEMU |
+| **Версия** | `0.1` (`MODULE_VERSION`) |
+| **Ядро** | Linux 6.18.37 (LTS), запуск в QEMU |
 | **Модуль** | `ktun.ko` → `/dev/ktun`, интерфейсы `ktun0`, `ktun1`, … |
 | **Утилита** | `ktunctl` — печать пакетов и ответ на `ping` из userspace |
-| **Проверка** | отладочное ядро: KASAN, lockdep, kmemleak, `DEBUG_ATOMIC_SLEEP` |
+| **Проверка** | 12 приёмочных сценариев на отладочном ядре (KASAN, lockdep, kmemleak, `DEBUG_ATOMIC_SLEEP`) — все пройдены |
+| **Лицензия** | GPL-2.0; заголовок ABI `ktun_ioctl.h` — GPL-2.0 WITH Linux-syscall-note |
+
+## Быстрый старт
+```sh
+make qemu-setup-debug   # один раз: отладочное ядро + initramfs (долго)
+make qemu-build tools   # build/ktun.ko и build/ktunctl
+devtools/boot.sh --test /mnt/host/devtools/demo.sh   # ping через ktun0, в конце "demo: OK"
+```
+
+Подробности — в разделах [Сборка и запуск](#сборка-и-запуск) и [Демонстрация](#демонстрация).
 
 ## Как это работает
 ### Общая картина
@@ -118,8 +129,19 @@ flowchart LR
 | `ioctl(KTUN_IOC_ATTACH)` | создаёт `ktunN` и навсегда привязывает его к этому открытому файлу |
 | `read` | один вызов = один пакет; ждёт, если очередь пуста (`EAGAIN` при `O_NONBLOCK`) |
 | `write` | один вызов = один IPv4/IPv6-пакет; интерфейс должен быть поднят |
-| `poll` | `EPOLLIN`, когда в очереди есть пакет; запись готова всегда |
+| `poll` | `EPOLLIN`, когда в очереди есть пакет; запись готова всегда; `EPOLLERR`, пока файл не привязан |
 | последний `close` | удаляет интерфейс и всё, что было в очереди |
+
+Если буфер `read` меньше пакета, программа получает начало пакета, остаток отбрасывается, а счётчик
+`truncated` в `/proc/ktun` растёт. Буфера на 64 КиБ хватает для любого MTU.
+
+| Ошибка | `read` | `write` |
+|--------|--------|---------|
+| `EBADFD` | файл не привязан к интерфейсу | файл не привязан к интерфейсу |
+| `EAGAIN` | очередь пуста, `O_NONBLOCK` | — |
+| `EIO` | — | интерфейс опущен (`DOWN`) |
+| `EINVAL` | — | длина меньше 20 байт или больше MTU; версия IP не 4 и не 6 |
+| `EFAULT` | плохой указатель буфера | плохой указатель буфера |
 
 **Жизненный цикл открытого файла:**
 ```mermaid
@@ -155,9 +177,13 @@ ABI в [src/ktun_ioctl.h](src/ktun_ioctl.h) общий для модуля и у
 ```console
 # cat /proc/ktun
 name     pid    state  queue   rx_packets  rx_bytes  tx_packets  tx_bytes  tx_dropped  truncated
-ktun0    123    up     0/64    3           252       3           252       0           0
-ktun1    131    down   2/64    0           0         2           168       0           0
+ktun0    102    up     0/64    0           0         1           48        0           0
+ktun1    104    up     0/64    2           168       3           216       0           0
 ```
+
+`queue` — сколько пакетов ждут чтения и лимит очереди. `tx_dropped` — пакеты, которые драйвер
+отбросил, потому что очередь уже была полна. При исправном управлении потоком этот счётчик равен нулю:
+стек останавливается раньше (см. [Управление потоком](#управление-потоком)).
 
 ### `/sys` — настройки
 | Файл | Доступ | Смысл |
@@ -167,6 +193,9 @@ ktun1    131    down   2/64    0           0         2           168       0    
 | `/sys/class/net/ktunN/ktun/queue_limit` | rw | лимит очереди этого интерфейса |
 | `/sys/class/net/ktunN/ktun/queue_len` | ro | сколько пакетов ждут чтения |
 | `/sys/class/net/ktunN/ktun/owner_pid` | ro | PID процесса, создавшего интерфейс |
+
+Значение вне `[1, 4096]` или не число отклоняется с `EINVAL`. Если поднять `queue_limit` у
+остановленного интерфейса, драйвер сразу возобновляет передачу.
 
 ## Устройство изнутри
 ### Управление потоком
@@ -219,7 +248,7 @@ flowchart LR
 ```
 
 Выгрузить модуль, пока открыт хоть один `/dev/ktun`, нельзя: `.owner = THIS_MODULE` держит ссылку на
-модуль, и `rmmod` вернёт ошибку.
+модуль, и `rmmod` вернёт ошибку (`Resource temporarily unavailable`).
 
 ### Структура исходников
 ```text
@@ -235,7 +264,16 @@ flowchart LR
 │   ├── procfs.c          # /proc/ktun
 │   └── sysfs.c           # атрибуты /sys
 ├── tools/ktunctl.c       # утилита: dump / echo / selftest
-└── devtools/             # стенд QEMU + demo.sh
+└── devtools/
+    ├── setup.sh          # скачать и собрать ядро + BusyBox initramfs (qemu-setup*)
+    ├── build.sh          # собрать модуль против ядра QEMU
+    ├── boot.sh           # запустить гостя: интерактивно, --gdb или --test CMD
+    ├── test.sh           # insmod -> dmesg -> rmmod (qemu-test)
+    ├── gdb.sh            # подключить GDB к гостю
+    ├── demo.sh           # демонстрация ping через ktun0 (запускается в госте)
+    ├── config.defaults   # версии, пути, память и CPU гостя
+    ├── kernel*.config    # фрагменты конфигурации ядра (обычный и отладочный)
+    └── initramfs/init    # PID 1 гостя: монтирование, 9p, режим --test
 ```
 
 ## Сборка и запуск
@@ -243,7 +281,9 @@ flowchart LR
 работает на обычном Linux и под WSL2, где заголовков ядра хоста нет.
 
 **Зависимости хоста:** `gcc`, `make`, `qemu-system-x86_64`, инструменты сборки ядра (`flex`, `bison`,
-`bc`, `libelf-dev`, `libssl-dev`), статическая `libc` для утилиты.
+`bc`, `libelf-dev`, `libssl-dev`), статическая `libc` для утилиты (`libc6-dev` в Debian). Необязательно:
+`gdb`, `clang-format`, `bear`. Если `/dev/kvm` доступен на запись, QEMU использует KVM, иначе
+работает медленнее, в программной эмуляции.
 
 ```sh
 make qemu-setup-debug   # один раз: ядро 6.18 с KASAN/lockdep/kmemleak + BusyBox initramfs
@@ -253,14 +293,25 @@ make qemu-test          # автотест: insmod -> dmesg -> rmmod, печат
 make qemu-boot          # интерактивный гость; каталог проекта смонтирован в /mnt/host
 ```
 
-KASAN примерно удваивает расход памяти гостя, поэтому стоит задать `QEMU_MEM="2G"` в
-`devtools/config.local`.
+| Цель `make` | Назначение |
+|-------------|------------|
+| `qemu-setup` | ядро без отладочных опций: собирается и работает быстрее |
+| `qemu-debug` + `gdb-attach` | гость ждёт GDB на порту `1234`; второе в соседнем терминале |
+| `load` / `unload` | `insmod`/`rmmod` в ядро **хоста** (нужны его заголовки; не для WSL2) |
+| `format` | `clang-format` для `src/` и `tools/` |
+| `compdb` | `.vscode/compile_commands.json` для clangd/IntelliSense |
+| `clean` | удалить `build/` |
+| `help` | список целей QEMU |
 
-Отладка через GDB: `make qemu-debug` в одном терминале, `make gdb-attach` в другом.
+Настройки стенда — в [devtools/config.defaults](devtools/config.defaults); переопределения кладутся в
+`devtools/config.local` (не в git). KASAN примерно удваивает расход памяти гостя, поэтому для
+отладочного ядра стоит задать `QEMU_MEM="2G"`. Если `cdn.kernel.org` недоступен, помогает
+`KERNEL_PREFER_MIRROR=1` — исходники скачиваются с зеркала на GitHub.
 
 ## Демонстрация
 ### Ответ на `ping` из userspace
-В госте (`make qemu-boot`):
+Весь сценарий записан в [devtools/demo.sh](devtools/demo.sh). Его можно запустить без интерактивного
+входа: `devtools/boot.sh --test /mnt/host/devtools/demo.sh`. Или вручную в госте (`make qemu-boot`):
 
 ```console
 # insmod /mnt/host/build/ktun.ko
@@ -270,10 +321,16 @@ ktun0
 # ip addr add 10.0.0.1/24 dev ktun0
 # ping -c 3 10.0.0.2
 PING 10.0.0.2 (10.0.0.2): 56 data bytes
-64 bytes from 10.0.0.2: seq=0 ttl=64 time=0.412 ms
-...
+64 bytes from 10.0.0.2: seq=0 ttl=64 time=29.880 ms
+64 bytes from 10.0.0.2: seq=1 ttl=64 time=4.807 ms
+64 bytes from 10.0.0.2: seq=2 ttl=64 time=4.308 ms
+
+--- 10.0.0.2 ping statistics ---
 3 packets transmitted, 3 packets received, 0% packet loss
 ```
+
+Параллельно `ktunctl` печатает каждый пакет и строку `ktun0:   -> echo reply written` на каждый
+отправленный ответ.
 
 Машины с адресом `10.0.0.2` не существует. На `ping` отвечает `ktunctl`: она прочитала echo request,
 поменяла местами адреса, сменила тип ICMP на echo reply, пересчитала контрольные суммы и записала
@@ -286,11 +343,15 @@ ktunctl [-n NAME] [-m MTU] echo      # печатать и отвечать на
 ktunctl selftest                     # проверить коды ошибок, которые не получить из shell
 ```
 
+`-n` задаёт имя интерфейса (можно шаблон вида `vpn%d`), `-m` — MTU сразу после создания. `dump` и
+`echo` первой строкой печатают имя созданного интерфейса и работают до сигнала; при их завершении
+интерфейс исчезает.
+
 ```console
 # ktunctl dump
 ktun0
-ktun0: IPv6 len=56 (skipped)
-ktun0: IPv4 ICMP 10.0.0.1 -> 10.0.0.2 echo request id=12 seq=1 len=84
+ktun0: IPv6 len=48 (skipped)
+ktun0: IPv4 ICMP 10.0.0.1 -> 10.0.0.2 echo request id=86 seq=0 len=84
 ```
 
 Утилита не настраивает адрес и не поднимает интерфейс — это делают стандартные команды `ip`. Так
@@ -298,25 +359,47 @@ ktun0: IPv4 ICMP 10.0.0.1 -> 10.0.0.2 echo request id=12 seq=1 len=84
 сообщения самого стека, утилита их только печатает.
 
 ## Проверка
-Все сценарии выполняются в одном сеансе QEMU на отладочном ядре.
+Все сценарии выполняются подряд в одном сеансе QEMU на отладочном ядре 6.18.37 (2 CPU, 2 ГБ).
+Последний прогон — 28.09.2026, версия `0.1`: **все 12 сценариев пройдены**.
 
-| # | Сценарий | Что показывает |
-|---|----------|----------------|
-| T1 | загрузка и выгрузка | `/dev/ktun` с правами `0600`, `/proc` и `/sys` на месте, `dmesg` чистый |
-| T2 | чтение непривязанного файла | `EBADFD` |
-| T3 | привязка | `ktun0` с флагами `POINTOPOINT,NOARP`, верный `owner_pid` |
-| T4 | стек → программа | `dump` видит ICMP echo request, растёт TX |
-| T5 | ответ на `ping` | 0% потерь, RX = 3 |
-| T6 | закрытие файла | интерфейс исчезает |
-| T7 | две программы | две независимые очереди и счётчики |
-| T8 | управление потоком | при остановленном читателе очередь не растёт выше лимита, нет `asks to queue packet` |
-| T9 | настройки `/sys` | неверные значения отклоняются, `default_queue_limit` применяется к новым интерфейсам |
-| T10 | MTU | `-m 1400` виден в `ip link`, `-m 10` — ошибка |
-| T11 | `ktunctl selftest` | все коды ошибок `ioctl`/`read`/`write` |
-| T12 | выгрузка и утечки | `rmmod` запрещён при открытом файле; kmemleak и `dmesg` пусты |
+| # | Сценарий | Результат |
+|---|----------|-----------|
+| T1 | загрузка и выгрузка | `/dev/ktun` — `crw-------`, `/proc/ktun` и `default_queue_limit = 64` на месте, `rmmod` успешен |
+| T2 | чтение непривязанного файла | `cat /dev/ktun` → `EBADFD` (`File descriptor in bad state`) |
+| T3 | привязка | `ktun0: <POINTOPOINT,NOARP> mtu 1500 qlen 500`, `owner_pid` совпадает с PID `ktunctl` |
+| T4 | стек → программа | `dump` видит `echo request`, в `/proc/ktun` растёт TX |
+| T5 | ответ на `ping` | `3 packets transmitted, 3 packets received, 0% packet loss` |
+| T6 | закрытие файла | после завершения `ktunctl` — `can't find device 'ktun0'`, `/proc/ktun` пуст |
+| T7 | две программы | `ktun0` и `ktun1` с независимыми очередями и счётчиками, `interface_count = 2` |
+| T8 | управление потоком | читатель остановлен, `queue_limit = 4`, 10 пингов: очередь `4/4`, `tx_dropped = 0`, нет `asks to queue packet`; после `SIGCONT` очередь пуста и трафик идёт |
+| T9 | настройки `/sys` | `0` и `abc` → `EINVAL`; после `128` новый интерфейс получает `queue_limit = 128` |
+| T10 | MTU | `-m 1400` → `mtu 1400` в `ip link`; `-m 10` → `attach: Invalid argument` |
+| T11 | `ktunctl selftest` | все проверки `PASS`, код выхода `0` |
+| T12 | выгрузка и утечки | при открытом файле `rmmod` отказывает; после закрытия выгружается; kmemleak и `dmesg` пусты |
+
+В госте BusyBox, и его `ip` не поддерживает `-s`, поэтому счётчики в T4–T8 смотрятся через
+`/proc/ktun`.
 
 **Критерий чистоты:** в `dmesg` нет `BUG:`, `WARNING:`, `possible circular locking`,
 `sleeping function called from invalid context`; kmemleak ничего не находит.
+
+`ktunctl selftest` проверяет ошибки, которые не получить из shell:
+
+```console
+# ktunctl selftest
+PASS 1 read unattached -> File descriptor in bad state
+PASS 2 write unattached -> File descriptor in bad state
+PASS 3 unknown ioctl -> Inappropriate ioctl for device
+PASS 4 attach -> ktun0
+PASS 4 second attach -> Device or resource busy
+PASS 5 write while down -> Input/output error
+PASS 6 SET_MTU 10 -> Invalid argument
+PASS 6 SET_MTU 100000 -> Invalid argument
+PASS 7 SET_MTU 1400 -> GET_INFO mtu=1400
+PASS 8 nonblocking read, empty queue -> Resource temporarily unavailable
+PASS 9 attach "lo" -> File exists
+selftest: PASS
+```
 
 **Стиль кода.** Имена в проекте — в личном стиле автора (PascalCase для функций, camelCase для
 переменных, `_` перед полями структур), поэтому `checkpatch` запускается без проверки CamelCase:
